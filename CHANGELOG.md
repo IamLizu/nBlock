@@ -11,6 +11,7 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 - `add/remove` now auto-bootstrap global wiring by default (no separate setup step).
 - `auto-setup` now injects global include in `http {}` of `nginx.conf` (layout-agnostic).
 - Added `--no-auto-setup` to skip bootstrap when already configured.
+- README wording updated to make global mode the default path and per-server mode optional.
 
 ### Added
 - `servers --server-file <path>` to list detected `server {}` blocks.

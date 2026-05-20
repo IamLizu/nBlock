@@ -6,7 +6,8 @@ It supports:
 - Add an IP block
 - Remove an IP block
 - List blocked IPs
-- Bind blocklist include to a specific `server {}` block
+- Global include bootstrap in `http {}` (layout-agnostic)
+- Optional bind to a specific `server {}` block
 - Optional Nginx test + reload
 
 ## Why
@@ -19,6 +20,7 @@ Manual edits to Nginx config for one-off abusive IPs are error-prone and slow.
 - `add <ip>`: append `deny <ip>;` if not present
 - `remove <ip>`: remove matching deny line
 - `list`: print blocked IPs
+- `auto-setup`: inject global include into `http {}` in `nginx.conf`
 - `servers --server-file`: list detected `server {}` blocks in a file
 - `bind-server`: attach include to exactly one selected `server {}` block
 - `--reload`: run `nginx -t` and reload Nginx
@@ -43,10 +45,16 @@ Replace `<GITHUB_USER>` and `<REPO>`:
 curl -fsSL https://raw.githubusercontent.com/<GITHUB_USER>/<REPO>/main/nblock \
 | sudo tee /usr/local/bin/nblock >/dev/null \
 && sudo chmod 0755 /usr/local/bin/nblock \
-&& sudo nblock add 191.96.67.213 --reload
+&& sudo nblock auto-setup
 ```
 
-Alternative: bind only one server block (instead of global):
+Then block an IP:
+
+```bash
+sudo nblock add 191.96.67.213 --reload
+```
+
+Alternative: bind only one server block (scope-limited mode):
 
 ```bash
 sudo nblock bind-server --server-file /etc/nginx/nginx.conf --server-name example.com --reload
@@ -68,7 +76,7 @@ Then use `nblock` instead of `./nblock`.
 sudo nblock add 191.96.67.213 --reload
 ```
 
-2) Optional per-server mode:
+2) Optional per-server mode (if you do not want global scope):
 
 ```bash
 sudo nblock servers --server-file /etc/nginx/nginx.conf
@@ -99,7 +107,7 @@ nblock servers --server-file <path>
 nblock bind-server --server-file <path> [--server-name <name>] [--listen <value>] [--index <n>] [--reload]
 ```
 
-## Per-Server Binding (Recommended)
+## Per-Server Binding (Optional)
 
 Use `bind-server` when one file contains multiple `server {}` blocks.
 
@@ -116,7 +124,7 @@ It inserts this line inside exactly one selected block:
 include /etc/nginx/blockips.conf;
 ```
 
-## How Auto-Setup Works (Global)
+## How Auto-Setup Works (Global Default)
 
 `auto-setup` injects this include directly into `http {}` in `nginx.conf`:
 
