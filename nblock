@@ -75,8 +75,10 @@ setup_auto_include() {
   awk -v inc="$include_line" '
     function brace_delta(str,   t, opens, closes) {
       t = str
+      sub(/#.*/, "", t)
       opens = gsub(/\{/, "", t)
       t = str
+      sub(/#.*/, "", t)
       closes = gsub(/\}/, "", t)
       return opens - closes
     }
@@ -151,12 +153,27 @@ setup_auto_include() {
         exit 2
       }
     }
-  ' "$NGINX_CONF" > "$tmp" || {
-    rm -f "$tmp"
-    echo "Could not inject include in http{} of $NGINX_CONF" >&2
-    echo "Use bind-server mode instead." >&2
-    exit 1
-  }
+  ' "$NGINX_CONF" > "$tmp" || true
+
+  if [[ ! -s "$tmp" ]] || ! grep -Fq "$include_line" "$tmp"; then
+    # Fallback: insert after the common conf.d include line.
+    awk -v inc="$include_line" '
+      BEGIN { inserted = 0 }
+      {
+        print
+        if (!inserted && $0 ~ /^[[:space:]]*include[[:space:]]+\/etc\/nginx\/conf\.d\/\*\.conf;[[:space:]]*$/) {
+          print "    " inc
+          inserted = 1
+        }
+      }
+      END { if (!inserted) exit 2 }
+    ' "$NGINX_CONF" > "$tmp" || {
+      rm -f "$tmp"
+      echo "Could not inject include in http{} of $NGINX_CONF" >&2
+      echo "Use bind-server mode instead." >&2
+      exit 1
+    }
+  fi
 
   cat "$tmp" > "$NGINX_CONF"
   rm -f "$tmp"
@@ -169,8 +186,10 @@ parse_server_blocks() {
     function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
     function brace_delta(str,   t, opens, closes) {
       t = str
+      sub(/#.*/, "", t)
       opens = gsub(/\{/, "", t)
       t = str
+      sub(/#.*/, "", t)
       closes = gsub(/\}/, "", t)
       return opens - closes
     }
