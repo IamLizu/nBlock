@@ -87,23 +87,45 @@ setup_auto_include() {
     }
     BEGIN {
       in_http = 0
+      pending_http = 0
       depth = 0
       inserted = 0
       seen = 0
     }
     {
       line = $0
-      if (!in_http && line ~ /^[[:space:]]*http[[:space:]]*\{/) {
+      no_comment = line
+      sub(/#.*/, "", no_comment)
+      stripped = trim(no_comment)
+
+      if (!in_http && stripped ~ /^http[[:space:]]*\{/) {
         in_http = 1
-        depth = 1
+        depth = brace_delta(line)
         print line
         next
       }
 
+      if (!in_http && pending_http == 0 && stripped ~ /^http$/) {
+        pending_http = 1
+        print line
+        next
+      }
+
+      if (!in_http && pending_http == 1) {
+        if (stripped ~ /^\{/) {
+          pending_http = 0
+          in_http = 1
+          depth = brace_delta(line)
+          print line
+          next
+        }
+        if (stripped != "") {
+          pending_http = 0
+        }
+      }
+
       if (in_http) {
-        check = line
-        sub(/#.*/, "", check)
-        check = trim(check)
+        check = stripped
         if (check == inc) {
           seen = 1
         }

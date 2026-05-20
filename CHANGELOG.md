@@ -13,6 +13,7 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 - Added `--no-auto-setup` to skip bootstrap when already configured.
 - README wording updated to make global mode the default path and per-server mode optional.
 - README one-line installer now uses the concrete `IamLizu/nBlock` raw URL.
+- `auto-setup` now also supports configs where `http` and `{` are on separate lines.
 
 ### Removed
 - `RELEASE_CHECKLIST.md` from version control.
