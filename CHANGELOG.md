@@ -12,6 +12,10 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 - `auto-setup` now injects global include in `http {}` of `nginx.conf` (layout-agnostic).
 - Added `--no-auto-setup` to skip bootstrap when already configured.
 - README wording updated to make global mode the default path and per-server mode optional.
+- README one-line installer now uses the concrete `IamLizu/nBlock` raw URL.
+
+### Removed
+- `RELEASE_CHECKLIST.md` from version control.
 
 ### Added
 - `servers --server-file <path>` to list detected `server {}` blocks.

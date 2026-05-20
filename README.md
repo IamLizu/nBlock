@@ -39,10 +39,8 @@ Manual edits to Nginx config for one-off abusive IPs are error-prone and slow.
 
 ### One-line install (recommended for first-time use)
 
-Replace `<GITHUB_USER>` and `<REPO>`:
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<GITHUB_USER>/<REPO>/main/nblock \
+curl -fsSL https://raw.githubusercontent.com/IamLizu/nBlock/main/nblock \
 | sudo tee /usr/local/bin/nblock >/dev/null \
 && sudo chmod 0755 /usr/local/bin/nblock \
 && sudo nblock auto-setup
