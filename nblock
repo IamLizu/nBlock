@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Lean utility for managing Nginx deny rules in a dedicated include file.
+# Default location can be overridden via BLOCKLIST_FILE env var.
+BLOCKLIST_FILE="${BLOCKLIST_FILE:-/etc/nginx/blockips.conf}"
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  nblock add <ip> [--reload] [--no-auto-setup]
+  nblock remove <ip> [--reload] [--no-auto-setup]
+  nblock list
+  nblock auto-setup
+  nblock servers --server-file <path>
+  nblock bind-server --server-file <path> [--server-name <name>] [--listen <value>] [--index <n>] [--reload]
+
+Environment:
+  BLOCKLIST_FILE  Path to deny include file (default: /etc/nginx/blockips.conf)
+  NGINX_CONF      Path to nginx.conf (default: /etc/nginx/nginx.conf)
+
+Examples:
+  sudo ./nblock add 191.96.67.213 --reload
+  sudo ./nblock list
+  sudo ./nblock remove 191.96.67.213 --reload
+  sudo ./nblock auto-setup
+  sudo ./nblock servers --server-file /etc/nginx/sites-enabled/app.conf
+  sudo ./nblock bind-server --server-file /etc/nginx/sites-enabled/app.conf --server-name api.example.com --reload
+EOF
+}
+
+is_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  read -r o1 o2 o3 o4 <<< "$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    (( o >= 0 && o <= 255 )) || return 1
+  done
+}
+
+ensure_file() {
+  local dir
+  dir="$(dirname "$BLOCKLIST_FILE")"
+  mkdir -p "$dir"
+  touch "$BLOCKLIST_FILE"
+}
+
+nginx_reload() {
+  nginx -t
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload nginx
+  else
+    nginx -s reload
+  fi
+}
+
+setup_auto_include() {
+  ensure_file
+
+  [[ -f "$NGINX_CONF" ]] || {
+    echo "nginx.conf not found: $NGINX_CONF" >&2
+    exit 1
+  }
+
+  local include_line="include $BLOCKLIST_FILE;"
+  if grep -Fq "$include_line" "$NGINX_CONF"; then
+    echo "Global include already present in $NGINX_CONF"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -v inc="$include_line" '
+    function brace_delta(str,   t, opens, closes) {
+      t = str
+      opens = gsub(/\{/, "", t)
+      t = str
+      closes = gsub(/\}/, "", t)
+      return opens - closes
+    }
+    function trim(s) {
+      sub(/^[ \t\r\n]+/, "", s)
+      sub(/[ \t\r\n]+$/, "", s)
+      return s
+    }
+    BEGIN {
+      in_http = 0
+      depth = 0
+      inserted = 0
+      seen = 0
+    }
+    {
+      line = $0
+      if (!in_http && line ~ /^[[:space:]]*http[[:space:]]*\{/) {
+        in_http = 1
+        depth = 1
+        print line
+        next
+      }
+
+      if (in_http) {
+        check = line
+        sub(/#.*/, "", check)
+        check = trim(check)
+        if (check == inc) {
+          seen = 1
+        }
+
+        delta = brace_delta(line)
+        if (depth + delta == 0 && seen == 0 && inserted == 0) {
+          print "    " inc
+          inserted = 1
+        }
+
+        print line
+        depth += delta
+        if (depth == 0) {
+          in_http = 0
+        }
+        next
+      }
+
+      print line
+    }
+    END {
+      if (inserted == 0 && seen == 0) {
+        exit 2
+      }
+    }
+  ' "$NGINX_CONF" > "$tmp" || {
+    rm -f "$tmp"
+    echo "Could not inject include in http{} of $NGINX_CONF" >&2
+    echo "Use bind-server mode instead." >&2
+    exit 1
+  }
+
+  cat "$tmp" > "$NGINX_CONF"
+  rm -f "$tmp"
+  echo "Global include added to http{} in $NGINX_CONF"
+}
+
+parse_server_blocks() {
+  local server_file="$1"
+  awk '
+    function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+    function brace_delta(str,   t, opens, closes) {
+      t = str
+      opens = gsub(/\{/, "", t)
+      t = str
+      closes = gsub(/\}/, "", t)
+      return opens - closes
+    }
+    BEGIN {
+      in_block = 0
+      depth = 0
+      idx = 0
+    }
+    {
+      line = $0
+      if (!in_block && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+        in_block = 1
+        idx++
+        start = NR
+        names = ""
+        listens = ""
+      }
+
+      if (in_block) {
+        no_comment = line
+        sub(/#.*/, "", no_comment)
+        stripped = trim(no_comment)
+
+        if (stripped ~ /^server_name[[:space:]]+/) {
+          sub(/^server_name[[:space:]]+/, "", stripped)
+          sub(/;[[:space:]]*$/, "", stripped)
+          gsub(/[[:space:]]+/, " ", stripped)
+          if (stripped != "") {
+            if (names != "") names = names " "
+            names = names stripped
+          }
+        }
+        if (stripped ~ /^listen[[:space:]]+/) {
+          sub(/^listen[[:space:]]+/, "", stripped)
+          sub(/;[[:space:]]*$/, "", stripped)
+          gsub(/[[:space:]]+/, " ", stripped)
+          if (stripped != "") {
+            if (listens != "") listens = listens " | "
+            listens = listens stripped
+          }
+        }
+
+        depth += brace_delta(line)
+        if (depth == 0) {
+          end = NR
+          print idx "\t" start "\t" end "\t" names "\t" listens
+          in_block = 0
+        }
+      }
+    }
+  ' "$server_file"
+}
+
+list_servers() {
+  local server_file="$1"
+  [[ -f "$server_file" ]] || { echo "File not found: $server_file" >&2; exit 1; }
+  local rows
+  rows="$(parse_server_blocks "$server_file")"
+  if [[ -z "$rows" ]]; then
+    echo "No server blocks found in $server_file"
+    return 0
+  fi
+
+  echo "Server blocks in $server_file:"
+  while IFS=$'\t' read -r idx start end names listens; do
+    [[ -n "$idx" ]] || continue
+    [[ -n "$names" ]] || names="-"
+    [[ -n "$listens" ]] || listens="-"
+    echo "[$idx] lines $start-$end | server_name: $names | listen: $listens"
+  done <<< "$rows"
+}
+
+block_has_include() {
+  local server_file="$1"
+  local start="$2"
+  local end="$3"
+  awk -v s="$start" -v e="$end" -v inc="include $BLOCKLIST_FILE;" '
+    NR >= s && NR <= e {
+      line = $0
+      sub(/#.*/, "", line)
+      gsub(/^[[:space:]]+/, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      if (line == inc) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$server_file"
+}
+
+bind_server() {
+  local server_file=""
+  local server_name=""
+  local listen_value=""
+  local index=""
+  local reload="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --server-file) server_file="${2:-}"; shift 2 ;;
+      --server-name) server_name="${2:-}"; shift 2 ;;
+      --listen) listen_value="${2:-}"; shift 2 ;;
+      --index) index="${2:-}"; shift 2 ;;
+      --reload) reload="true"; shift ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  [[ -n "$server_file" ]] || { echo "--server-file is required" >&2; exit 1; }
+  [[ -f "$server_file" ]] || { echo "File not found: $server_file" >&2; exit 1; }
+  if [[ -z "$server_name" && -z "$listen_value" && -z "$index" ]]; then
+    echo "Provide at least one selector: --server-name, --listen, or --index" >&2
+    exit 1
+  fi
+  if [[ -n "$index" && ! "$index" =~ ^[0-9]+$ ]]; then
+    echo "--index must be a number" >&2
+    exit 1
+  fi
+
+  local rows
+  rows="$(parse_server_blocks "$server_file")"
+  [[ -n "$rows" ]] || { echo "No server blocks found in $server_file" >&2; exit 1; }
+
+  local matches=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS=$'\t' read -r idx start end names listens <<< "$line"
+    local ok="true"
+
+    if [[ -n "$server_name" ]]; then
+      local name_match="false"
+      for n in $names; do
+        if [[ "$n" == "$server_name" ]]; then
+          name_match="true"
+          break
+        fi
+      done
+      [[ "$name_match" == "true" ]] || ok="false"
+    fi
+
+    if [[ -n "$listen_value" ]]; then
+      [[ "$listens" == *"$listen_value"* ]] || ok="false"
+    fi
+
+    if [[ -n "$index" ]]; then
+      [[ "$idx" == "$index" ]] || ok="false"
+    fi
+
+    if [[ "$ok" == "true" ]]; then
+      matches+=("$line")
+    fi
+  done <<< "$rows"
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "No matching server block found."
+    list_servers "$server_file"
+    exit 1
+  fi
+
+  if [[ ${#matches[@]} -gt 1 ]]; then
+    echo "Multiple server blocks matched. Refine with --index."
+    for line in "${matches[@]}"; do
+      IFS=$'\t' read -r idx start end names listens <<< "$line"
+      [[ -n "$names" ]] || names="-"
+      [[ -n "$listens" ]] || listens="-"
+      echo "[$idx] lines $start-$end | server_name: $names | listen: $listens"
+    done
+    exit 1
+  fi
+
+  IFS=$'\t' read -r idx start end names listens <<< "${matches[0]}"
+  ensure_file
+
+  if block_has_include "$server_file" "$start" "$end"; then
+    echo "Include already present in server block [$idx]."
+  else
+    local tmp
+    tmp="$(mktemp)"
+    awk -v e="$end" -v inc="    include $BLOCKLIST_FILE;" '
+      NR == e { print inc }
+      { print }
+    ' "$server_file" > "$tmp"
+    cat "$tmp" > "$server_file"
+    rm -f "$tmp"
+    echo "Bound blocklist include to server block [$idx] in $server_file"
+  fi
+
+  if [[ "$reload" == "true" ]]; then
+    nginx_reload
+    echo "Nginx reloaded."
+  else
+    echo "Run: sudo nginx -t && sudo systemctl reload nginx"
+  fi
+}
+
+add_ip() {
+  local ip="$1"
+  local reload="${2:-false}"
+  local auto_setup="${3:-true}"
+  is_ipv4 "$ip" || { echo "Invalid IPv4: $ip" >&2; exit 1; }
+  if [[ "$auto_setup" == "true" ]]; then
+    setup_auto_include
+  fi
+  ensure_file
+
+  if grep -Eq "^[[:space:]]*deny[[:space:]]+$ip;[[:space:]]*$" "$BLOCKLIST_FILE"; then
+    echo "IP already blocked: $ip"
+    return 0
+  fi
+
+  echo "deny $ip;" >> "$BLOCKLIST_FILE"
+  echo "Blocked: $ip"
+
+  if [[ "$reload" == "true" ]]; then
+    nginx_reload
+    echo "Nginx reloaded."
+  else
+    echo "Run: sudo nginx -t && sudo systemctl reload nginx"
+  fi
+}
+
+remove_ip() {
+  local ip="$1"
+  local reload="${2:-false}"
+  local auto_setup="${3:-true}"
+  is_ipv4 "$ip" || { echo "Invalid IPv4: $ip" >&2; exit 1; }
+  if [[ "$auto_setup" == "true" ]]; then
+    setup_auto_include
+  fi
+  ensure_file
+
+  local tmp
+  tmp="$(mktemp)"
+  grep -Ev "^[[:space:]]*deny[[:space:]]+$ip;[[:space:]]*$" "$BLOCKLIST_FILE" > "$tmp" || true
+
+  if cmp -s "$BLOCKLIST_FILE" "$tmp"; then
+    rm -f "$tmp"
+    echo "IP not found: $ip"
+    return 0
+  fi
+
+  cat "$tmp" > "$BLOCKLIST_FILE"
+  rm -f "$tmp"
+  echo "Unblocked: $ip"
+
+  if [[ "$reload" == "true" ]]; then
+    nginx_reload
+    echo "Nginx reloaded."
+  else
+    echo "Run: sudo nginx -t && sudo systemctl reload nginx"
+  fi
+}
+
+list_ips() {
+  ensure_file
+  if [[ ! -s "$BLOCKLIST_FILE" ]]; then
+    echo "No blocked IPs."
+    return 0
+  fi
+
+  awk '
+    /^[[:space:]]*deny[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+;[[:space:]]*$/ {
+      gsub(/^[[:space:]]*deny[[:space:]]+/, "", $0)
+      gsub(/;[[:space:]]*$/, "", $0)
+      print
+    }
+  ' "$BLOCKLIST_FILE" | nl -w2 -s'. '
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    add)
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      local reload="false"
+      local auto_setup="true"
+      local ip="$1"
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --reload) reload="true" ;;
+          --no-auto-setup) auto_setup="false" ;;
+          *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+        shift
+      done
+      add_ip "$ip" "$reload" "$auto_setup"
+      ;;
+    remove)
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      local reload="false"
+      local auto_setup="true"
+      local ip="$1"
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --reload) reload="true" ;;
+          --no-auto-setup) auto_setup="false" ;;
+          *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+        shift
+      done
+      remove_ip "$ip" "$reload" "$auto_setup"
+      ;;
+    list)
+      list_ips
+      ;;
+    auto-setup)
+      setup_auto_include
+      ;;
+    servers)
+      [[ "${1:-}" == "--server-file" && $# -ge 2 ]] || { echo "Usage: nblock servers --server-file <path>" >&2; exit 1; }
+      list_servers "$2"
+      ;;
+    bind-server)
+      bind_server "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
