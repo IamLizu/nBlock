@@ -170,4 +170,4 @@ sudo nblock remove 191.96.67.213 --reload
 
 ## License
 
-MIT (or your preferred license).
+MIT. See `LICENSE`.
